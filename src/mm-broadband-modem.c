@@ -116,6 +116,7 @@ enum {
     PROP_MODEM_VOICE_CALL_LIST,
     PROP_MODEM_SIMPLE_STATUS,
     PROP_MODEM_SIM_HOT_SWAP_SUPPORTED,
+    PROP_MODEM_SIM_HOT_SWAP_CONFIGURED,
     PROP_FLOW_CONTROL,
     PROP_LAST
 };
@@ -134,6 +135,7 @@ struct _MMBroadbandModemPrivate {
     PortsContext *sim_hot_swap_ports_ctx;
     gboolean modem_init_run;
     gboolean sim_hot_swap_supported;
+    gboolean sim_hot_swap_configured;
 
     /*<--- Modem interface --->*/
     /* Properties */
@@ -10242,27 +10244,38 @@ initialize_step (InitializeContext *ctx)
          * (we may be re-running the initialization step after SIM-PIN unlock) */
         if (!ctx->self->priv->sim_hot_swap_ports_ctx) {
             gboolean is_sim_hot_swap_supported = FALSE;
+            gboolean is_sim_hot_swap_configured = FALSE;
 
             g_object_get (ctx->self,
                           MM_IFACE_MODEM_SIM_HOT_SWAP_SUPPORTED, &is_sim_hot_swap_supported,
                           NULL);
 
+            g_object_get (ctx->self,
+                          MM_IFACE_MODEM_SIM_HOT_SWAP_CONFIGURED, &is_sim_hot_swap_configured,
+                          NULL);
+
             if (is_sim_hot_swap_supported) {
-                PortsContext *ports;
-                GError *error = NULL;
 
-                mm_dbg ("Creating ports context for SIM hot swap");
+                if (!is_sim_hot_swap_configured) {
+                    mm_warn ("SIM hot swap supported but not configured. Skipping opening ports");
+                } else {
+                    PortsContext *ports;
+                    GError *error = NULL;
 
-                ports = g_new0 (PortsContext, 1);
-                ports->ref_count = 1;
+                    mm_dbg ("Creating ports context for SIM hot swap");
 
-                if (!open_ports_enabling (ctx->self, ports, FALSE, &error)) {
-                    mm_warn ("Couldn't open ports during Modem SIM hot swap enabling: %s", error? error->message : "unknown reason");
-                    g_error_free (error);
-                } else
-                    ctx->self->priv->sim_hot_swap_ports_ctx = ports_context_ref (ports);
+                    ports = g_new0 (PortsContext, 1);
+                    ports->ref_count = 1;
 
-                ports_context_unref (ports);
+                    if (!open_ports_enabling (ctx->self, ports, FALSE, &error)) {
+                        mm_warn ("Couldn't open ports during Modem SIM hot swap enabling: %s", error? error->message : "unknown reason");
+                        g_error_free (error);
+                    } else {
+                        ctx->self->priv->sim_hot_swap_ports_ctx = ports_context_ref (ports);
+                    }
+
+                    ports_context_unref (ports);
+                }
             }
         } else
             mm_dbg ("Ports context for SIM hot swap already available");
@@ -10291,34 +10304,47 @@ initialize_step (InitializeContext *ctx)
             } else {
                 /* Fatal SIM, firmware, or modem failure :-( */
                 gboolean is_sim_hot_swap_supported = FALSE;
+                gboolean is_sim_hot_swap_configured = FALSE;
+
                 MMModemStateFailedReason reason =
                     mm_gdbus_modem_get_state_failed_reason (
                         (MmGdbusModem*)ctx->self->priv->modem_dbus_skeleton);
 
                 g_object_get (ctx->self,
-                             MM_IFACE_MODEM_SIM_HOT_SWAP_SUPPORTED,
-                             &is_sim_hot_swap_supported,
-                             NULL);
+                              MM_IFACE_MODEM_SIM_HOT_SWAP_SUPPORTED,
+                              &is_sim_hot_swap_supported,
+                              NULL);
 
-                if (reason == MM_MODEM_STATE_FAILED_REASON_SIM_MISSING &&
-                    is_sim_hot_swap_supported &&
-                    ctx->self->priv->sim_hot_swap_ports_ctx) {
-                        mm_info ("SIM is missing, but the modem supports SIM hot swap. Waiting for SIM...");
+                g_object_get (ctx->self,
+                              MM_IFACE_MODEM_SIM_HOT_SWAP_CONFIGURED,
+                              &is_sim_hot_swap_configured,
+                              NULL);
+
+                if (reason == MM_MODEM_STATE_FAILED_REASON_SIM_MISSING) {
+                    if (!is_sim_hot_swap_supported) {
+                        mm_dbg ("SIM is missing, but this modem does not support SIM hot swap.");
+                    } else if (!is_sim_hot_swap_configured) {
+                        mm_warn ("SIM is missing, but SIM hot swap could not be configured.");
+                    } else if (!ctx->self->priv->sim_hot_swap_ports_ctx) {
+                        mm_err ("SIM is missing and SIM hot swap is configured, but ports are not opened.");
+                    } else {
+                        mm_dbg ("SIM is missing, but SIM hot swap is enabled. Waiting for SIM...");
                         g_simple_async_result_set_error (ctx->result,
                                                          MM_CORE_ERROR,
                                                          MM_CORE_ERROR_WRONG_STATE,
                                                          "Modem is unusable due to SIM missing, "
-                                                         "cannot fully initialize, "
-                                                         "waiting for SIM insertion.");
-                } else {
-                    mm_dbg ("SIM is missing and Modem does not support SIM Hot Swap");
-                    g_simple_async_result_set_error (ctx->result,
-                                                     MM_CORE_ERROR,
-                                                     MM_CORE_ERROR_WRONG_STATE,
-                                                     "Modem is unusable, "
-                                                     "cannot fully initialize");
+                                                         "cannot fully initialize, waiting for SIM insertion.");
+                        goto sim_hot_swap_enabled;
+                    }
+
                 }
 
+                g_simple_async_result_set_error (ctx->result,
+                                                 MM_CORE_ERROR,
+                                                 MM_CORE_ERROR_WRONG_STATE,
+                                                 "Modem is unusable, "
+                                                 "cannot fully initialize");
+sim_hot_swap_enabled:
                 /* Ensure we only leave the Modem, OMA, and Firmware interfaces
                  * around.  A failure could be caused by firmware issues, which
                  * a firmware update, switch, or provisioning could fix.
@@ -10644,6 +10670,9 @@ set_property (GObject *object,
     case PROP_MODEM_SIM_HOT_SWAP_SUPPORTED:
         self->priv->sim_hot_swap_supported = g_value_get_boolean (value);
         break;
+    case PROP_MODEM_SIM_HOT_SWAP_CONFIGURED:
+        self->priv->sim_hot_swap_configured = g_value_get_boolean (value);
+        break;
     default:
         G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
         break;
@@ -10748,6 +10777,9 @@ get_property (GObject *object,
         break;
     case PROP_MODEM_SIM_HOT_SWAP_SUPPORTED:
         g_value_set_boolean (value, self->priv->sim_hot_swap_supported);
+        break;
+    case PROP_MODEM_SIM_HOT_SWAP_CONFIGURED:
+        g_value_set_boolean (value, self->priv->sim_hot_swap_configured);
         break;
     case PROP_FLOW_CONTROL:
         g_value_set_flags (value, self->priv->flow_control);
@@ -11248,6 +11280,9 @@ mm_broadband_modem_class_init (MMBroadbandModemClass *klass)
                                       PROP_MODEM_SIM_HOT_SWAP_SUPPORTED,
                                       MM_IFACE_MODEM_SIM_HOT_SWAP_SUPPORTED);
 
+    g_object_class_override_property (object_class,
+                                      PROP_MODEM_SIM_HOT_SWAP_CONFIGURED,
+                                      MM_IFACE_MODEM_SIM_HOT_SWAP_CONFIGURED);
     properties[PROP_FLOW_CONTROL] =
         g_param_spec_flags (MM_BROADBAND_MODEM_FLOW_CONTROL,
                             "Flow control",
